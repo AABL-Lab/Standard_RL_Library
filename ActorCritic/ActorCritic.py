@@ -5,6 +5,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from collections import deque
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch.distributions import MultivariateNormal
@@ -19,7 +20,7 @@ from sklearn.linear_model import LinearRegression
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class Actor(nn.Module):
-    def __init__(self, state_space_dim, action_space_dim, continuous_action_space=False, action_std_dev=None, lr=0.001):
+    def __init__(self, state_space_dim, action_space_dim, continuous_action_space=False, action_std_dev=None, lr=1e-3):
         super(Actor, self).__init__()
         # Setting up for continuous spaces
         self.continuous_action_space = continuous_action_space
@@ -38,14 +39,15 @@ class Actor(nn.Module):
                             nn.Tanh())
         else:
             # If not continous setup actor slightly different
-            self.actor = nn.Sequential(nn.Linear(state_space_dim, 64),
+            self.actor = nn.Sequential(nn.Linear(state_space_dim, 32),
                             nn.Tanh(),
-                            nn.Linear(64, 64),
+                            nn.Linear(32, 32),
                             nn.Tanh(),
-                            nn.Linear(64, action_space_dim),
-                            nn.Softmax(dim=-1)) # We want it to be one be discrete actions spaces are one dimensional
+                            nn.Linear(32, action_space_dim),
+                            nn.Tanh(),
+                            nn.Softmax(dim=-1)) # We want it to be one because discrete actions spaces are one dimensional
         
-        self.optim = optim.SGD(self.parameters(), lr=lr)
+        self.optim = optim.Adam(self.parameters(), lr=lr)
 
     def forward(self, x):
         x = torch.from_numpy(x).float().unsqueeze(0).to(DEVICE)
@@ -80,7 +82,7 @@ class Actor(nn.Module):
 
         action = dist.sample()
         action_logprob = dist.log_prob(action)
-        return action.detach(), action_logprob.detach()
+        return action, action_logprob
     
     def loss(self, state_value, new_state_value, reward, log_prob, discount, I):
         advantage = reward + discount * new_state_value.item() - state_value.item()
@@ -94,16 +96,16 @@ class Actor(nn.Module):
         self.optim.step()
                   
 class Critic(nn.Module):
-    def __init__(self, state_space_dim, lr=0.001):
+    def __init__(self, state_space_dim, lr=1e-3):
         super(Critic, self).__init__()
         # Critic is a state value estimator, it doesn't really care about actions
-        self.critic = nn.Sequential(nn.Linear(state_space_dim, 64),
+        self.critic = nn.Sequential(nn.Linear(state_space_dim, 32),
                         nn.Tanh(),
-                        nn.Linear(64, 64),
+                        nn.Linear(32, 32),
                         nn.Tanh(),
-                        nn.Linear(64, 1))
+                        nn.Linear(32, 1))
         
-        self.optim = optim.SGD(self.parameters(), lr=lr)
+        self.optim = optim.Adam(self.parameters(), lr=lr)
         
     def forward(self, x):
         x = torch.from_numpy(x).float().unsqueeze(0).to(DEVICE)
@@ -121,7 +123,7 @@ class Critic(nn.Module):
         self.optim.step()
 
 class ActorCritic():
-    def __init__(self, state_space_dim, action_space_dim, continuous_action_space=False, action_std_dev=None, actor_lr=0.001, critic_lr=0.001, num_episodes=1000, max_steps=10000, discount=0.99):
+    def __init__(self, state_space_dim, action_space_dim, continuous_action_space=False, action_std_dev=None, actor_lr=1e-3, critic_lr=1e-3, num_episodes=1000, max_steps=10000, discount=0.99, solved_score=195):
         self.actor = Actor(state_space_dim, action_space_dim, continuous_action_space, action_std_dev, actor_lr)
         self.critic = Critic(state_space_dim, critic_lr)
 
@@ -129,6 +131,7 @@ class ActorCritic():
         self.num_episodes = num_episodes
         self.max_steps = max_steps
         self.discount = discount
+        self.solved_score = solved_score
 
     def get_action(self, state):
         '''
@@ -136,7 +139,7 @@ class ActorCritic():
         '''
         action, action_logprob = self.actor.act(state)
         state_val = self.critic.forward(state)
-        return action.detach(), action_logprob.detach(), state_val.detach()
+        return action, action_logprob, state_val
     
     def loss(self, state_value, new_state_value, reward, action_logprob, I):
         state_value_loss = self.critic.loss(state_value, new_state_value, reward, self.discount, I)
@@ -149,6 +152,7 @@ class ActorCritic():
 
     def train(self, env):
         scores = []
+        recent_scores = deque(maxlen = 100)
         for episode in tqdm(range(self.num_episodes)):
             # Reset everything to starting states
             state = env.reset()
@@ -159,7 +163,8 @@ class ActorCritic():
             I = 1
             for step in range(self.max_steps):
                 action, action_logprob, state_value = self.get_action(state)
-                new_state, reward, done, _ = env.step(action)
+                action = action.item()
+                new_state, reward, done, _, _ = env.step(action)
                 score += reward
                 # If the action finished the task, the next state value is zero! Don't go further you're done!
                 if done:
@@ -177,7 +182,11 @@ class ActorCritic():
                 # Transition to new state
                 state = new_state
                 I *= self.discount
+
             scores.append(score)
+            recent_scores.append(score)
+            if np.array(recent_scores).mean() >= self.solved_score:
+                break
         return scores
 
 if __name__ == '__main__':
@@ -198,5 +207,24 @@ if __name__ == '__main__':
     plt.plot(y_pred)
     plt.show()
 
+    done = False
+    state = env.reset()
+    scores = []
+
+    for _ in tqdm(range(50)):
+        state = env.reset()
+        state = state[0]
+        done = False
+        score = 0
+        while not done:
+            #env.render()
+            action, action_logprob, state_value = actorcritic.get_action(state)
+            action = action.item()            
+            new_state, reward, done, info, _ = env.step(action)
+            score += reward
+            state = new_state
+        scores.append(score)
+    env.close()
+    print(np.array(scores).mean())
 
 
